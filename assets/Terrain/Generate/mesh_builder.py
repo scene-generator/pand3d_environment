@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Any, Iterable
@@ -8,17 +8,21 @@ from typing import Callable, Optional, Any, Iterable
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from shapely.geometry import Polygon, MultiPolygon, LineString, MultiLineString, GeometryCollection
+from shapely.geometry import (
+    Polygon,
+    MultiPolygon,
+    LineString,
+    MultiLineString,
+    GeometryCollection,
+)
+from shapely.plotting import plot_polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import triangulate
+from shapely.ops import unary_union
 from shapely.geometry.polygon import orient
+from panda3d.core import CullFaceAttrib
 import trimesh
-import yaml
-
-try:
-    from .house.house_gen import HOUSE_GEN
-except ImportError:
-    from house.house_gen import HOUSE_GEN
+import matplotlib.pyplot as plt
 
 from panda3d.core import (
     Geom,
@@ -30,11 +34,10 @@ from panda3d.core import (
     GeomVertexReader,
     NodePath,
     Filename,
-    Texture, 
-    TexturePool, 
-    TextureStage
+    Texture,
+    TexturePool,
+    TextureStage,
 )
-
 
 ROAD_WIDTHS = {
     "motorway": 22.0,
@@ -50,11 +53,50 @@ ROAD_WIDTHS = {
 }
 
 DEFAULT_BUILDING_HEIGHT = 8.0
-DEFAULT_ROAD_THICKNESS = 0.25
-DEFAULT_WATER_THICKNESS = 0.08
-DEFAULT_PARK_THICKNESS = 0.05
+DEFAULT_ROAD_THICKNESS = -3.0
+DEFAULT_WATER_THICKNESS = -3.0
+DEFAULT_PARK_THICKNESS = -3.0
 BRIDGE_CLEARANCE = 5.0
 EPS = 1e-8
+DEFAULT_SIDEWALK_WIDTH = 1.5
+DEFAULT_SIDEWALK_THICKNESS = -2.85
+SIDEWALK_GAP = 0.5
+DEFAULT_SURFACE_THICKNESS = -3.0
+VERIFY = False
+
+
+def _sidewalk_side(row, side: str) -> bool:
+    """
+    Determine whether an OSM road has a sidewalk on a given side.
+
+    Supported:
+        sidewalk=both
+        sidewalk=left
+        sidewalk=right
+        sidewalk=yes
+        sidewalk=no
+
+    Also supports:
+        sidewalk:left
+        sidewalk:right
+    """
+    sidewalk = str(row.get("sidewalk", "")).strip().lower()
+
+    if sidewalk == "both":
+        return True
+
+    if sidewalk == side:
+        return True
+
+    if sidewalk == "yes":
+        return True
+
+    if sidewalk == "no":
+        return False
+
+    side_value = str(row.get(f"sidewalk:{side}", "")).strip().lower()
+
+    return side_value in ("yes", "true", "1")
 
 
 def _first_scalar(value, default=None):
@@ -115,10 +157,18 @@ def _ensure_single_polygon(geom: BaseGeometry):
 def _buffer_road_geometry(geom: BaseGeometry, width: float):
     if geom is None or geom.is_empty:
         return None
+
     if geom.geom_type in ("LineString", "MultiLineString"):
-        return geom.buffer(width * 0.5, cap_style=2, join_style=2)
+        return geom.buffer(
+            width * 0.5,
+            cap_style=2,
+            join_style=1,
+            resolution=4,
+        )
+
     if geom.geom_type in ("Polygon", "MultiPolygon"):
         return geom
+
     return None
 
 
@@ -132,10 +182,15 @@ def _geom_to_xy_polygon(geom: BaseGeometry):
 def _polygon_valid_tris(poly: Polygon):
     tris = triangulate(poly)
     valid = []
+    if VERIFY:
+        fig, ax = plt.subplots()
     for tri in tris:
         rp = tri.representative_point()
         if poly.contains(rp) or poly.touches(rp):
             valid.append(tri)
+        if VERIFY:
+            ax.plot(tri.exterior.xy[0], tri.exterior.xy[1], "-o")
+            ax.fill(tri.exterior.xy[0], tri.exterior.xy[1], alpha=0.5)
     return valid
 
 
@@ -145,6 +200,7 @@ def _face_normal(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
     if norm < EPS:
         return np.array([0.0, 0.0, 1.0], dtype=float)
     return n / norm
+
 
 def _repair_geom(geom: BaseGeometry):
     if geom is None or geom.is_empty:
@@ -156,6 +212,7 @@ def _repair_geom(geom: BaseGeometry):
     if geom.is_empty:
         return None
     return geom
+
 
 def _iter_polygon_parts(geom: BaseGeometry):
     """
@@ -178,11 +235,13 @@ def _iter_polygon_parts(geom: BaseGeometry):
         for part in geom.geoms:
             yield from _iter_polygon_parts(part)
 
+
 def _iter_rings(poly: Polygon):
     yield poly.exterior
     for hole in poly.interiors:
         yield hole
-            
+
+
 @dataclass
 class MeshAsset:
     name: str
@@ -193,15 +252,6 @@ class MeshAsset:
 
 
 class CityMeshBuilder:
-    HOUSE_CONFIG_PATH = Path(__file__).resolve().parent / "house" / "config" / "extended_house.yaml"
-    LANDUSE_HOUSE_TYPES = {
-        "residential": ("single_family", "1_story", "bungalow"),
-        "commercial": ("commercial", "2_story", "mixed_use"),
-        "retail": ("commercial", "1_story", "storefront"),
-        "industrial": ("industrial", "1_story", "warehouse"),
-        "townhome": ("townhome", "2_story", "duplex"),
-    }
-
     def __init__(
         self,
         terrain_sampler: Callable[[float, float], float],
@@ -213,11 +263,10 @@ class CityMeshBuilder:
         self.buildings: list[BuildingAsset] = []
         self.tile_size = 500.0
         self.tiles = {}
+        self.surface_coverage: dict[tuple[int, int], BaseGeometry] = {}
         self.root = NodePath("city_root")
-        with self.HOUSE_CONFIG_PATH.open("r", encoding="utf-8") as config_file:
-            self.house_configs = yaml.safe_load(config_file)
-        self.house_generator = HOUSE_GEN.__new__(HOUSE_GEN)
-        self.house_texture_cache: dict[tuple[int, int, bytes], Texture] = {}
+        if VERIFY:
+            self.fig, self.ax = plt.subplots()
 
     def sample_ground_z(self, geom: BaseGeometry) -> float:
         x, y = _representative_xy(geom)
@@ -225,13 +274,32 @@ class CityMeshBuilder:
 
     def _tile_key(self, x: float, y: float) -> tuple[int, int]:
         return (int(np.floor(x / self.tile_size)), int(np.floor(y / self.tile_size)))
-    
+
     def _get_tile_node(self, tile_key: tuple[int, int]) -> NodePath:
         if tile_key not in self.tiles:
             ix, iy = tile_key
             tile_node = self.root.attachNewNode(f"tile_{ix}_{iy}")
             self.tiles[tile_key] = tile_node
         return self.tiles[tile_key]
+
+    def _claim_surface_geometry(
+        self, geom: BaseGeometry, tile_key: tuple[int, int]
+    ) -> BaseGeometry | None:
+        """Remove previously claimed surface area, then add the remainder."""
+        geom = _repair_geom(geom)
+        if geom is None:
+            return None
+
+        covered = self.surface_coverage.get(tile_key)
+        if covered is not None:
+            geom = _repair_geom(geom.difference(covered))
+            if geom is None:
+                return None
+
+        self.surface_coverage[tile_key] = _repair_geom(
+            geom if covered is None else unary_union((covered, geom))
+        )
+        return geom
 
     @staticmethod
     def _normalize_landuse(value) -> str | None:
@@ -240,230 +308,197 @@ class CityMeshBuilder:
             return None
         return str(value).split(";")[0].strip().lower() or None
 
-    def _house_config_for_landuse(self, landuse: str | None):
-        config_path = self.LANDUSE_HOUSE_TYPES.get(landuse)
-        if config_path is None:
-            return None, None
+    def _trimesh_to_panda(
+        self,
+        mesh: trimesh.Trimesh,
+        name: str,
+    ) -> NodePath:
+        """
+        Convert a trimesh.Trimesh into a Panda3D GeomNode.
+        """
 
-        config = self.house_configs
-        for key in config_path:
-            config = config[key]
-        return config, "/".join(config_path)
+        fmt = GeomVertexFormat.getV3n3t2()
 
-    def _make_house_node(self, scene: trimesh.Scene, footprint: Polygon, height: float, name: str) -> NodePath:
-        meshes = scene.dump()
-        if not meshes:
-            return NodePath(name)
+        vdata = GeomVertexData(
+            name,
+            fmt,
+            Geom.UHStatic,
+        )
 
-        source_bounds = scene.bounds
-        xmin, ymin, zmin = source_bounds[0]
-        xmax, ymax, zmax = source_bounds[1]
-        target_xmin, target_ymin, target_xmax, target_ymax = footprint.bounds
-        source_size = np.array([xmax - xmin, ymax - ymin, zmax - zmin], dtype=float)
-        target_size = np.array([
-            target_xmax - target_xmin,
-            target_ymax - target_ymin,
-            max(float(height), EPS),
-        ])
-        scale = np.divide(target_size, source_size, out=np.ones(3), where=source_size > EPS)
-        offset = np.array([target_xmin, target_ymin, 0.0]) - np.array([xmin, ymin, zmin]) * scale
+        vwriter = GeomVertexWriter(
+            vdata,
+            "vertex",
+        )
 
-        root = NodePath(name)
-        texture_stage = TextureStage("house_texture")
+        nwriter = GeomVertexWriter(
+            vdata,
+            "normal",
+        )
 
-        for mesh_index, mesh in enumerate(meshes):
-            vertices = np.asarray(mesh.vertices, dtype=float) * scale + offset
-            faces = np.asarray(mesh.faces, dtype=int)
-            uv_data = getattr(mesh.visual, "uv", None)
-            face_colors = None
-            if getattr(mesh.visual, "kind", None) in ("face", "vertex"):
-                face_colors = np.asarray(mesh.visual.face_colors, dtype=np.uint8)
+        twriter = GeomVertexWriter(
+            vdata,
+            "texcoord",
+        )
 
-            vdata = GeomVertexData(
-                f"{name}_{mesh_index}",
-                GeomVertexFormat.getV3n3c4t2(),
-                Geom.UHStatic,
+        # ---------------------------------------------------------
+        # Vertices, normals, UVs
+        # ---------------------------------------------------------
+        vertices = np.asarray(mesh.vertices)
+        normals = np.asarray(mesh.vertex_normals)
+
+        for vertex, normal in zip(vertices, normals):
+
+            x = float(vertex[0])
+            y = float(vertex[1])
+            z = float(vertex[2])
+
+            vwriter.addData3f(
+                x,
+                y,
+                z,
             )
-            vertex_writer = GeomVertexWriter(vdata, "vertex")
-            normal_writer = GeomVertexWriter(vdata, "normal")
-            color_writer = GeomVertexWriter(vdata, "color")
-            texcoord_writer = GeomVertexWriter(vdata, "texcoord")
-            triangles = GeomTriangles(Geom.UHStatic)
 
-            for face_index, face in enumerate(faces):
-                points = vertices[face]
-                normal = _face_normal(points[0], points[1], points[2])
-                color = (255, 255, 255, 255) if face_colors is None else face_colors[face_index]
-                if len(color) == 3:
-                    color = (*color, 255)
+            nwriter.addData3f(
+                float(normal[0]),
+                float(normal[1]),
+                float(normal[2]),
+            )
 
-                first_vertex = vdata.getNumRows()
-                for corner, vertex_index in enumerate(face):
-                    point = vertices[vertex_index]
-                    vertex_writer.addData3f(*map(float, point))
-                    normal_writer.addData3f(*map(float, normal))
-                    color_writer.addData4f(*(float(channel) / 255.0 for channel in color))
-                    uv = (0.0, 0.0) if uv_data is None else uv_data[vertex_index]
-                    texcoord_writer.addData2f(float(uv[0]), float(uv[1]))
-                triangles.addVertices(first_vertex, first_vertex + 1, first_vertex + 2)
-                triangles.closePrimitive()
+            # Simple world-space UVs.
+            # Adjust these values to control texture repetition.
+            twriter.addData2f(
+                x * 0.02,
+                y * 0.02,
+            )
 
-            geom = Geom(vdata)
-            geom.addPrimitive(triangles)
-            geom_node = GeomNode(f"{name}_{mesh_index}")
-            geom_node.addGeom(geom)
-            part = root.attachNewNode(geom_node)
+        # ---------------------------------------------------------
+        # Triangle indices
+        # ---------------------------------------------------------
+        prim = GeomTriangles(Geom.UHStatic)
 
-            material = getattr(mesh.visual, "material", None)
-            image = getattr(material, "image", None)
-            if image is not None and uv_data is not None:
-                from PIL import Image
+        for face in mesh.faces:
 
-                if not isinstance(image, Image.Image):
-                    image = Image.fromarray(np.asarray(image))
-                image = image.convert("RGBA")
-                image_data = image.tobytes()
-                texture_key = (image.width, image.height, hashlib.sha256(image_data).digest())
-                texture = self.house_texture_cache.get(texture_key)
-                if texture is None:
-                    texture = Texture(f"house_texture_{len(self.house_texture_cache)}")
-                    texture.setup2dTexture(
-                        image.width,
-                        image.height,
-                        Texture.T_unsigned_byte,
-                        Texture.F_rgba,
-                    )
-                    texture.setRamImage(image_data)
-                    self.house_texture_cache[texture_key] = texture
-                part.setTexture(texture_stage, texture, 1)
+            prim.addVertices(
+                int(face[0]),
+                int(face[1]),
+                int(face[2]),
+            )
 
-        return root
-    
-    def _make_geomnode_from_extrusion(self, geom: BaseGeometry, height: float, name: str, color: Optional[tuple[float, float, float, float]] = None,) -> NodePath:
-        """
-        Create a Panda3D GeomNode from an extruded polygonal geometry.
+            prim.closePrimitive()
 
-        Supports:
-        - Polygon
-        - MultiPolygon
-        - GeometryCollection containing polygonal parts
-        """
+        # ---------------------------------------------------------
+        # Panda3D Geom
+        # ---------------------------------------------------------
+        geom = Geom(vdata)
+        geom.addPrimitive(prim)
+
+        node = GeomNode(name)
+        node.addGeom(geom)
+
+        nodepath = NodePath(node)
+
+        return nodepath
+
+    def _extrude_to_trimesh(
+        self,
+        geom: BaseGeometry,
+        height: float,
+    ):
         geom = _repair_geom(geom)
+
+        if geom is None:
+            return None
+
+        meshes = []
+
+        for poly in _iter_polygon_parts(geom):
+            try:
+                mesh = trimesh.creation.extrude_polygon(
+                    poly,
+                    height=float(height),
+                )
+
+                if not mesh.is_empty:
+                    meshes.append(mesh)
+
+            except Exception as e:
+                print(f"[WARN] Failed to extrude geometry: {e}")
+
+        if not meshes:
+            return None
+
+        return meshes[0] if len(meshes) == 1 else trimesh.util.concatenate(meshes)
+
+    def _make_geomnode_from_extrusion(
+        self,
+        geom: BaseGeometry,
+        height: float,
+        name: str,
+    ) -> NodePath:
+        """
+        Convert:
+
+            Shapely geometry
+                -> trimesh extrusion
+                -> Panda3D GeomNode
+
+        Supports Polygon, MultiPolygon, and GeometryCollection.
+        """
+
+        geom = _repair_geom(geom)
+
         if geom is None:
             return NodePath(name)
 
-        # Position + normal + texture coordinates
-        fmt = GeomVertexFormat.getV3n3t2()
-        vdata = GeomVertexData(name, fmt, Geom.UHStatic)
-        vwriter = GeomVertexWriter(vdata, "vertex")
-        nwriter = GeomVertexWriter(vdata, "normal")
-        twriter = GeomVertexWriter(vdata, "texcoord")
-        prim = GeomTriangles(Geom.UHStatic)
+        meshes = []
 
-        # Texture scaling controls
-        cap_uv_scale = 0.02   # flat surfaces
-        side_u_scale = 0.02   # along wall length
-        side_v_scale = 0.10   # vertical repeat
-
-        def add_tri(p0, p1, p2, normal, uv0, uv1, uv2):
-            start_index = vdata.getNumRows()
-            for p, uv in ((p0, uv0), (p1, uv1), (p2, uv2)):
-                vwriter.addData3f(float(p[0]), float(p[1]), float(p[2]))
-                nwriter.addData3f(float(normal[0]), float(normal[1]), float(normal[2]))
-                twriter.addData2f(float(uv[0]), float(uv[1]))
-            prim.addVertices(start_index, start_index + 1, start_index + 2)
-            prim.closePrimitive()
-
-        def ring_segments(coords):
-            pts = list(coords)
-            if len(pts) < 2:
-                return []
-            if np.allclose(pts[0], pts[-1]):
-                pts = pts[:-1]
-            if len(pts) < 2:
-                return []
-            return [(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
-
-        def cap_uv(x: float, y: float) -> tuple[float, float]:
-            return (x * cap_uv_scale, y * cap_uv_scale)
-
-        def add_polygon(poly: Polygon):
-            poly = orient(poly, sign=1.0)
-
-            # Top / bottom caps
-            cap_tris = _polygon_valid_tris(poly)
-            for tri in cap_tris:
-                coords = list(tri.exterior.coords)[:3]
-                p0 = np.array([coords[0][0], coords[0][1], 0.0], dtype=float)
-                p1 = np.array([coords[1][0], coords[1][1], 0.0], dtype=float)
-                p2 = np.array([coords[2][0], coords[2][1], 0.0], dtype=float)
-
-                uv0 = cap_uv(coords[0][0], coords[0][1])
-                uv1 = cap_uv(coords[1][0], coords[1][1])
-                uv2 = cap_uv(coords[2][0], coords[2][1])
-
-                # bottom
-                add_tri(p0, p2, p1,
-                        np.array([0.0, 0.0, -1.0], dtype=float),
-                        uv0, uv2, uv1)
-
-                # top
-                p0t = p0.copy(); p0t[2] = height
-                p1t = p1.copy(); p1t[2] = height
-                p2t = p2.copy(); p2t[2] = height
-                add_tri(p0t, p1t, p2t,
-                        np.array([0.0, 0.0, 1.0], dtype=float),
-                        uv0, uv1, uv2)
-
-            # Side walls for exterior + holes
-            for ring in _iter_rings(poly):
-                coords = list(ring.coords)
-                ccw = ring.is_ccw
-
-                for p0_xy, p1_xy in ring_segments(coords):
-                    x0, y0 = float(p0_xy[0]), float(p0_xy[1])
-                    x1, y1 = float(p1_xy[0]), float(p1_xy[1])
-
-                    b0 = np.array([x0, y0, 0.0], dtype=float)
-                    b1 = np.array([x1, y1, 0.0], dtype=float)
-                    t0 = np.array([x0, y0, height], dtype=float)
-                    t1 = np.array([x1, y1, height], dtype=float)
-
-                    edge_len = float(np.linalg.norm(np.array([x1 - x0, y1 - y0], dtype=float)))
-                    u0 = 0.0
-                    u1 = edge_len * side_u_scale
-                    v0 = 0.0
-                    v1 = height * side_v_scale
-
-                    edge = np.array([x1 - x0, y1 - y0, 0.0], dtype=float)
-                    up = np.array([0.0, 0.0, 1.0], dtype=float)
-                    normal = _face_normal(b0, b1, t1)
-                    if np.linalg.norm(normal) < EPS:
-                        normal = np.cross(edge, up)
-                        nrm = np.linalg.norm(normal)
-                        if nrm < EPS:
-                            normal = np.array([0.0, 1.0, 0.0], dtype=float)
-                        else:
-                            normal = normal / nrm
-
-                    # Exterior and hole rings need opposite winding
-                    if ccw:
-                        add_tri(b0, b1, t1, normal, (u0, v0), (u1, v0), (u1, v1))
-                        add_tri(b0, t1, t0, normal, (u0, v0), (u1, v1), (u0, v1))
-                    else:
-                        add_tri(b0, t1, b1, normal, (u0, v0), (u1, v1), (u1, v0))
-                        add_tri(b0, t0, t1, normal, (u0, v0), (u0, v1), (u1, v1))
-
+        # ---------------------------------------------------------
+        # Shapely -> trimesh extrusion
+        # ---------------------------------------------------------
         for poly in _iter_polygon_parts(geom):
-            add_polygon(poly)
 
-        node = GeomNode(name)
-        g = Geom(vdata)
-        g.addPrimitive(prim)
-        node.addGeom(g)
-        return NodePath(node)   
-     
-    def _add_asset(self, name: str, nodepath: NodePath, kind: str, source_index: int, metadata: dict, tile_key):
+            if poly is None or poly.is_empty:
+                continue
+            try:
+                mesh = trimesh.creation.extrude_polygon(
+                    poly,
+                    height=float(height),
+                )
+                if mesh.is_empty:
+                    continue
+                meshes.append(mesh)
+
+            except Exception as e:
+                print(f"[WARN] Failed to extrude {name}: {e}")
+
+        if not meshes:
+            return NodePath(name)
+
+        # ---------------------------------------------------------
+        # Combine polygon parts
+        # ---------------------------------------------------------
+        if len(meshes) == 1:
+            mesh = meshes[0]
+        else:
+            mesh = trimesh.util.concatenate(meshes)
+
+        # ---------------------------------------------------------
+        # trimesh -> Panda3D
+        # ---------------------------------------------------------
+        return self._trimesh_to_panda(
+            mesh,
+            name,
+        )
+
+    def _add_asset(
+        self,
+        name: str,
+        nodepath: NodePath,
+        kind: str,
+        source_index: int,
+        metadata: dict,
+        tile_key,
+    ):
         parent = self._get_tile_node(tile_key)
         nodepath.reparentTo(parent)
         self.assets.append(
@@ -487,18 +522,25 @@ class CityMeshBuilder:
 
         for asset_idx, row in enumerate(buildings.itertuples(index=False)):
             geom = getattr(row, "geometry", None)
-            poly = _geom_to_xy_polygon(geom)
-            if poly is None:
+            geom = _repair_geom(geom)
+            if geom is None or not any(_iter_polygon_parts(geom)):
                 continue
 
             # Use precomputed metadata if present
             height = getattr(row, "height_m", None)
+            if type(height) == str:
+                try:
+                    height = float(height)
+                except ValueError:
+                    height = None
             if height is None or np.isnan(height):
                 height = _parse_height_m(getattr(row, "height", None))
             if height is None or np.isnan(height):
                 levels = getattr(row, "building_levels", None)
                 if levels is None:
-                    levels = getattr(row, "_4", None)  # only if your dataframe layout is odd; otherwise remove
+                    levels = getattr(
+                        row, "_4", None
+                    )  # only if your dataframe layout is odd; otherwise remove
                 try:
                     if levels is not None and not pd.isna(levels):
                         height = float(levels) * 3.0
@@ -506,8 +548,7 @@ class CityMeshBuilder:
                     pass
             if height is None or np.isnan(height):
                 height = DEFAULT_BUILDING_HEIGHT
-
-            x, y = _representative_xy(poly)
+            x, y = _representative_xy(geom)
             tile_key = self._tile_key(x, y)
 
             # Cache ground sampling by tile center-ish location
@@ -515,22 +556,28 @@ class CityMeshBuilder:
             if cache_key in ground_cache:
                 base_z = ground_cache[cache_key]
             else:
-                base_z = self.sample_ground_z(poly)
+                base_z = self.sample_ground_z(geom)
                 ground_cache[cache_key] = base_z
 
             landuse_tag = self._normalize_landuse(getattr(row, "landuse_tag", None))
-            house_config, house_type = self._house_config_for_landuse(landuse_tag)
-            if house_config is None and landuse_tag is None and height >= 8.0:
-                house_config, house_type = self._house_config_for_landuse("townhome")
+            if landuse_tag is None:
+                landuse_tag = self._normalize_landuse(getattr(row, "building", None))
 
             building_name = f"building_{asset_start + asset_idx}"
-            if house_config is not None:
-                house_scene = self.house_generator.create_house(house_config)
-                node = self._make_house_node(house_scene, poly, height, building_name)
-            else:
-                node = self._make_geomnode_from_extrusion(poly, height, building_name)
+            node = self._make_geomnode_from_extrusion(
+                geom,
+                height,
+                building_name,
+            )
+            color = tuple(random.uniform(0.2, 1.0) for _ in range(3))
+            node.setColor(
+                color[0],
+                color[1],
+                color[2],
+                1.0,
+            )
             node.setZ(base_z)
-
+            node.setAttrib(CullFaceAttrib.make(CullFaceAttrib.MCullNone))
             building = BuildingAsset(
                 name=building_name,
                 nodepath=node,
@@ -544,7 +591,6 @@ class CityMeshBuilder:
                     "base_z": float(base_z),
                     "landuse_tag": landuse_tag,
                     "building": getattr(row, "building", None),
-                    "house_type": house_type,
                 },
             )
 
@@ -561,50 +607,558 @@ class CityMeshBuilder:
                     metadata=building.metadata,
                 )
             )
-        
+            # return
+
     def add_roads(self, roads: gpd.GeoDataFrame):
         if roads is None or roads.empty:
             return
-        for asset_idx, (gdf_idx, row) in enumerate(roads.iterrows()):
+
+        # ---------------------------------------------------------
+        # Group road polygons by tile
+        # ---------------------------------------------------------
+        road_polygons = {}
+        bridge_polygons = {}
+
+        road_z_values = {}
+        bridge_z_values = {}
+
+        road_counts = {}
+        bridge_counts = {}
+
+        road_columns = set(roads.columns)
+
+        for asset_idx, row in enumerate(roads.itertuples(index=False)):
             geom = row.geometry
-            highway = _normalize_highway(row.get("highway", "default"))
-            width = float(ROAD_WIDTHS.get(highway, ROAD_WIDTHS["default"]))
-            road_poly = _buffer_road_geometry(geom, width)
-            if road_poly is None:
+
+            if geom is None or geom.is_empty:
                 continue
 
-            base_z = self.sample_ground_z(geom)
+            # -----------------------------------------------------
+            # Highway type
+            # -----------------------------------------------------
+            if "highway" in road_columns:
+                highway = _normalize_highway(getattr(row, "highway", "default"))
+            else:
+                highway = "default"
+
+            width = float(
+                ROAD_WIDTHS.get(
+                    highway,
+                    ROAD_WIDTHS["default"],
+                )
+            )
+
+            # -----------------------------------------------------
+            # Create road footprint
+            # -----------------------------------------------------
+            road_poly = _buffer_road_geometry(
+                geom,
+                width,
+            )
+
+            if road_poly is None or road_poly.is_empty:
+                continue
+
+            # -----------------------------------------------------
+            # Bridge detection
+            # -----------------------------------------------------
             is_bridge = False
-            if "bridge" in roads.columns:
-                is_bridge = str(row.get("bridge", "")).strip().lower() in ("yes", "true", "1")
-            if "layer" in roads.columns:
+
+            if "bridge" in road_columns:
+                bridge_value = getattr(
+                    row,
+                    "bridge",
+                    None,
+                )
+
+                is_bridge = str(bridge_value).strip().lower() in (
+                    "yes",
+                    "true",
+                    "1",
+                )
+
+            if "layer" in road_columns:
                 try:
-                    is_bridge = is_bridge or (float(row.get("layer", 0)) > 0)
-                except Exception:
+                    layer = float(getattr(row, "layer", 0))
+
+                    if layer > 0:
+                        is_bridge = True
+
+                except (TypeError, ValueError):
                     pass
+
+            # -----------------------------------------------------
+            # Terrain height
+            # -----------------------------------------------------
+            base_z = self.sample_ground_z(geom)
+
             if is_bridge:
                 base_z += BRIDGE_CLEARANCE
-            x, y = _representative_xy(geom)
-            tile_key = self._tile_key(x, y)
-            node = self._make_geomnode_from_extrusion(
-                road_poly,
-                DEFAULT_ROAD_THICKNESS,
-                f"road_{len(self.assets)}",
-            )
-            node.setZ(base_z)
 
-            self._add_asset(
-                name=f"road_{len(self.assets)}",
-                nodepath=node,
-                kind="bridge" if is_bridge else "road",
-                source_index=asset_idx,
-                metadata={
-                    "highway": highway,
-                    "width_m": width,
-                    "base_z": float(base_z),
-                    "bridge": bool(is_bridge),
-                },
-                tile_key=tile_key,
+            # -----------------------------------------------------
+            # Tile
+            # -----------------------------------------------------
+            x, y = _representative_xy(geom)
+
+            tile_key = self._tile_key(x, y)
+
+            # -----------------------------------------------------
+            # Store polygon
+            # -----------------------------------------------------
+            if is_bridge:
+
+                bridge_polygons.setdefault(tile_key, []).append(road_poly)
+
+                bridge_z_values.setdefault(tile_key, []).append(base_z)
+
+                bridge_counts[tile_key] = bridge_counts.get(tile_key, 0) + 1
+
+            else:
+
+                road_polygons.setdefault(tile_key, []).append(road_poly)
+
+                road_z_values.setdefault(tile_key, []).append(base_z)
+
+                road_counts[tile_key] = road_counts.get(tile_key, 0) + 1
+
+        # =========================================================
+        # Merge normal roads
+        # =========================================================
+        for tile_key, polygons in road_polygons.items():
+
+            if not polygons:
+                continue
+
+            merged = unary_union(polygons)
+
+            # Repair geometry
+            merged = _repair_geom(merged)
+
+            if merged is None:
+                continue
+
+            merged = self._claim_surface_geometry(merged, tile_key)
+            if merged is None:
+                continue
+
+            # -----------------------------------------------------
+            # Determine elevation
+            # -----------------------------------------------------
+            z_values = road_z_values[tile_key]
+
+            if z_values:
+                base_z = float(np.mean(z_values))
+            else:
+                base_z = 0.0
+
+            # -----------------------------------------------------
+            # Shapely -> trimesh
+            # -----------------------------------------------------
+            mesh = self._extrude_to_trimesh(
+                merged,
+                DEFAULT_ROAD_THICKNESS,
+            )
+
+            if mesh is None:
+                continue
+
+            # -----------------------------------------------------
+            # Move to terrain
+            # -----------------------------------------------------
+            mesh.apply_translation(
+                [
+                    0.0,
+                    0.0,
+                    base_z,
+                ]
+            )
+
+            # -----------------------------------------------------
+            # Convert to Panda3D
+            # -----------------------------------------------------
+            name = f"road_layer_" f"{tile_key[0]}_" f"{tile_key[1]}"
+
+            node = self._trimesh_to_panda(
+                mesh,
+                name,
+            )
+
+            node.reparentTo(self._get_tile_node(tile_key))
+
+            # -----------------------------------------------------
+            # Register layer
+            # -----------------------------------------------------
+            self.assets.append(
+                MeshAsset(
+                    name=name,
+                    nodepath=node,
+                    kind="road",
+                    source_index=-1,
+                    metadata={
+                        "layer": "road",
+                        "tile": tile_key,
+                        "feature_count": road_counts[tile_key],
+                        "merged": True,
+                    },
+                )
+            )
+
+        # =========================================================
+        # Bridges
+        # =========================================================
+        for tile_key, polygons in bridge_polygons.items():
+
+            if not polygons:
+                continue
+
+            merged = unary_union(polygons)
+
+            merged = _repair_geom(merged)
+
+            if merged is None:
+                continue
+
+            z_values = bridge_z_values[tile_key]
+
+            base_z = float(np.mean(z_values)) if z_values else 0.0
+
+            mesh = self._extrude_to_trimesh(
+                merged,
+                DEFAULT_ROAD_THICKNESS,
+            )
+
+            if mesh is None:
+                continue
+
+            mesh.apply_translation(
+                [
+                    0.0,
+                    0.0,
+                    base_z,
+                ]
+            )
+
+            name = f"bridge_layer_" f"{tile_key[0]}_" f"{tile_key[1]}"
+
+            node = self._trimesh_to_panda(
+                mesh,
+                name,
+            )
+
+            node.reparentTo(self._get_tile_node(tile_key))
+
+            self.assets.append(
+                MeshAsset(
+                    name=name,
+                    nodepath=node,
+                    kind="bridge",
+                    source_index=-1,
+                    metadata={
+                        "layer": "bridge",
+                        "tile": tile_key,
+                        "feature_count": bridge_counts[tile_key],
+                        "merged": True,
+                    },
+                )
+            )
+
+    def add_sidewalks(
+        self,
+        sidewalks: gpd.GeoDataFrame | None = None,
+        roads: gpd.GeoDataFrame | None = None,
+        width: float = DEFAULT_SIDEWALK_WIDTH,
+        thickness: float = DEFAULT_SIDEWALK_THICKNESS,
+    ):
+        """
+        Build merged sidewalk layers per tile.
+
+        Sources:
+            1. Explicit OSM sidewalk geometries
+            2. Sidewalks inferred from OSM road tags
+
+        The final output is one sidewalk mesh per tile.
+        """
+
+        # ============================================================
+        # Collect sidewalk polygons by tile
+        # ============================================================
+        sidewalk_tiles: dict[tuple[int, int], list[BaseGeometry]] = {}
+        sidewalk_counts: dict[tuple[int, int], int] = {}
+
+        # ============================================================
+        # 1. Explicitly mapped sidewalks
+        # ============================================================
+        if sidewalks is not None and not sidewalks.empty:
+
+            geom_idx = sidewalks.columns.get_loc("geometry")
+
+            for asset_idx, row in enumerate(
+                sidewalks.itertuples(index=False, name=None)
+            ):
+                geom = row[geom_idx]
+
+                if geom is None or geom.is_empty:
+                    continue
+
+                if geom.geom_type not in (
+                    "LineString",
+                    "MultiLineString",
+                ):
+                    continue
+
+                sidewalk_poly = geom.buffer(
+                    width * 0.5,
+                    cap_style=2,
+                    join_style=1,
+                )
+
+                if sidewalk_poly is None or sidewalk_poly.is_empty:
+                    continue
+
+                x, y = _representative_xy(geom)
+                tile_key = self._tile_key(x, y)
+
+                sidewalk_tiles.setdefault(
+                    tile_key,
+                    [],
+                ).append(sidewalk_poly)
+
+                sidewalk_counts[tile_key] = sidewalk_counts.get(tile_key, 0) + 1
+
+        # ============================================================
+        # 2. Generate sidewalks from road tags
+        # ============================================================
+        if roads is not None and not roads.empty:
+
+            cols = roads.columns
+            geom_idx = cols.get_loc("geometry")
+
+            has_sidewalk = "sidewalk" in cols
+            has_left = "sidewalk:left" in cols
+            has_right = "sidewalk:right" in cols
+
+            if has_sidewalk or has_left or has_right:
+
+                for asset_idx, row in enumerate(
+                    roads.itertuples(index=False, name=None)
+                ):
+                    geom = row[geom_idx]
+
+                    if geom is None or geom.is_empty:
+                        continue
+
+                    if geom.geom_type not in (
+                        "LineString",
+                        "MultiLineString",
+                    ):
+                        continue
+
+                    # ------------------------------------------------
+                    # Convert tuple back to named values
+                    # ------------------------------------------------
+                    row_data = {col: row[i] for i, col in enumerate(cols)}
+
+                    create_left = _sidewalk_side(
+                        row_data,
+                        "left",
+                    )
+
+                    create_right = _sidewalk_side(
+                        row_data,
+                        "right",
+                    )
+
+                    if not create_left and not create_right:
+                        continue
+
+                    # ------------------------------------------------
+                    # Road width
+                    # ------------------------------------------------
+                    highway = _normalize_highway(
+                        row_data.get(
+                            "highway",
+                            "default",
+                        )
+                    )
+
+                    road_width = float(
+                        ROAD_WIDTHS.get(
+                            highway,
+                            ROAD_WIDTHS["default"],
+                        )
+                    )
+
+                    # Centerline -> sidewalk center
+                    offset = road_width * 0.5 + width * 0.5 + SIDEWALK_GAP
+
+                    # ------------------------------------------------
+                    # Representative point / tile
+                    # ------------------------------------------------
+                    x, y = _representative_xy(geom)
+
+                    tile_key = self._tile_key(
+                        x,
+                        y,
+                    )
+
+                    # ------------------------------------------------
+                    # LEFT
+                    # ------------------------------------------------
+                    if create_left:
+
+                        sidewalk_line = geom.parallel_offset(
+                            offset,
+                            "left",
+                            join_style=1,
+                        )
+
+                        if sidewalk_line is not None and not sidewalk_line.is_empty:
+
+                            sidewalk_poly = sidewalk_line.buffer(
+                                width * 0.5,
+                                cap_style=2,
+                                join_style=1,
+                            )
+
+                            if sidewalk_poly is not None and not sidewalk_poly.is_empty:
+                                sidewalk_tiles.setdefault(
+                                    tile_key,
+                                    [],
+                                ).append(sidewalk_poly)
+
+                                sidewalk_counts[tile_key] = (
+                                    sidewalk_counts.get(
+                                        tile_key,
+                                        0,
+                                    )
+                                    + 1
+                                )
+
+                    # ------------------------------------------------
+                    # RIGHT
+                    # ------------------------------------------------
+                    if create_right:
+
+                        sidewalk_line = geom.parallel_offset(
+                            offset,
+                            "right",
+                            join_style=1,
+                        )
+
+                        if sidewalk_line is not None and not sidewalk_line.is_empty:
+
+                            sidewalk_poly = sidewalk_line.buffer(
+                                width * 0.5,
+                                cap_style=2,
+                                join_style=1,
+                            )
+
+                            if sidewalk_poly is not None and not sidewalk_poly.is_empty:
+                                sidewalk_tiles.setdefault(
+                                    tile_key,
+                                    [],
+                                ).append(sidewalk_poly)
+
+                                sidewalk_counts[tile_key] = (
+                                    sidewalk_counts.get(
+                                        tile_key,
+                                        0,
+                                    )
+                                    + 1
+                                )
+
+        # ============================================================
+        # Nothing to build
+        # ============================================================
+        if not sidewalk_tiles:
+            return
+
+        # ============================================================
+        # Merge + extrude one sidewalk layer per tile
+        # ============================================================
+        for tile_key, polygons in sidewalk_tiles.items():
+
+            if not polygons:
+                continue
+
+            # --------------------------------------------------------
+            # Merge overlapping sidewalk polygons
+            # --------------------------------------------------------
+            merged = unary_union(polygons)
+
+            merged = _repair_geom(merged)
+
+            if merged is None:
+                continue
+
+            merged = self._claim_surface_geometry(merged, tile_key)
+            if merged is None:
+                continue
+
+            # --------------------------------------------------------
+            # Terrain elevation
+            # --------------------------------------------------------
+            base_z = self.sample_ground_z(merged)
+
+            base_z += SIDEWALK_GAP
+
+            # --------------------------------------------------------
+            # Shapely -> trimesh
+            # --------------------------------------------------------
+            mesh = self._extrude_to_trimesh(
+                merged,
+                thickness,
+            )
+
+            if mesh is None:
+                continue
+
+            # --------------------------------------------------------
+            # Move to world Z
+            # --------------------------------------------------------
+            mesh.apply_translation(
+                [
+                    0.0,
+                    0.0,
+                    base_z,
+                ]
+            )
+
+            # --------------------------------------------------------
+            # trimesh -> Panda3D
+            # --------------------------------------------------------
+            name = f"sidewalk_layer_" f"{tile_key[0]}_" f"{tile_key[1]}"
+
+            node = self._trimesh_to_panda(
+                mesh,
+                name,
+            )
+
+            node.reparentTo(self._get_tile_node(tile_key))
+
+            node.setAttrib(CullFaceAttrib.make(CullFaceAttrib.MCullNone))
+
+            # --------------------------------------------------------
+            # Register one asset for the entire tile
+            # --------------------------------------------------------
+            self.assets.append(
+                MeshAsset(
+                    name=name,
+                    nodepath=node,
+                    kind="sidewalk",
+                    source_index=-1,
+                    metadata={
+                        "layer": "sidewalk",
+                        "tile": tile_key,
+                        "width_m": float(width),
+                        "thickness_m": float(thickness),
+                        "feature_count": sidewalk_counts.get(
+                            tile_key,
+                            0,
+                        ),
+                        "merged": True,
+                    },
+                )
             )
 
     def add_bridges(self, roads: gpd.GeoDataFrame):
@@ -617,7 +1171,14 @@ class CityMeshBuilder:
         bridge_mask = np.zeros(len(roads), dtype=bool)
 
         if "bridge" in roads.columns:
-            bridge_mask |= roads["bridge"].fillna("").astype(str).str.lower().isin(["yes", "true", "1"]).to_numpy()
+            bridge_mask |= (
+                roads["bridge"]
+                .fillna("")
+                .astype(str)
+                .str.lower()
+                .isin(["yes", "true", "1"])
+                .to_numpy()
+            )
 
         if "layer" in roads.columns:
             try:
@@ -646,6 +1207,8 @@ class CityMeshBuilder:
                 f"bridge_{len(self.assets)}",
             )
             node.setZ(base_z)
+            node.setAttrib(CullFaceAttrib.make(CullFaceAttrib.MCullNone))
+            node.setTwoSided(True)
 
             self._add_asset(
                 name=f"bridge_{len(self.assets)}",
@@ -668,15 +1231,20 @@ class CityMeshBuilder:
             poly = _geom_to_xy_polygon(row.geometry)
             if poly is None:
                 continue
-            z = self.sample_ground_z(poly)
             x, y = _representative_xy(poly)
             tile_key = self._tile_key(x, y)
+            poly = self._claim_surface_geometry(poly, tile_key)
+            if poly is None:
+                continue
+            z = self.sample_ground_z(poly)
             node = self._make_geomnode_from_extrusion(
                 poly,
                 DEFAULT_WATER_THICKNESS,
                 f"water_{len(self.assets)}",
             )
             node.setZ(z)
+            node.setAttrib(CullFaceAttrib.make(CullFaceAttrib.MCullNone))
+            node.setTwoSided(True)
             self._add_asset(
                 name=f"water_{len(self.assets)}",
                 nodepath=node,
@@ -693,15 +1261,20 @@ class CityMeshBuilder:
             poly = _geom_to_xy_polygon(row.geometry)
             if poly is None:
                 continue
-            z = self.sample_ground_z(poly)
             x, y = _representative_xy(poly)
             tile_key = self._tile_key(x, y)
+            poly = self._claim_surface_geometry(poly, tile_key)
+            if poly is None:
+                continue
+            z = self.sample_ground_z(poly)
             node = self._make_geomnode_from_extrusion(
                 poly,
                 DEFAULT_PARK_THICKNESS,
                 f"park_{len(self.assets)}",
             )
             node.setZ(z)
+            node.setAttrib(CullFaceAttrib.make(CullFaceAttrib.MCullNone))
+            node.setTwoSided(True)
             self._add_asset(
                 name=f"park_{len(self.assets)}",
                 nodepath=node,
@@ -710,8 +1283,90 @@ class CityMeshBuilder:
                 metadata={"surface_z": float(z)},
                 tile_key=tile_key,
             )
-            
-    def _write_obj_from_nodepath(self, nodepath: NodePath, fh, object_name: str, vertex_offset: int) -> int:
+
+    def add_surface_features(self, features: gpd.GeoDataFrame | None, kind: str):
+        if features is None or features.empty:
+            return
+
+        z_offsets = {
+            "terrain": -0.08,
+            "landuse": -0.02,
+            "parking": 0.03,
+            "railway_areas": 0.035,
+            "pedestrian": 0.045,
+        }
+        if kind not in z_offsets:
+            raise ValueError(f"Unsupported ground surface kind: {kind}")
+
+        for asset_idx, (_, row) in enumerate(features.iterrows()):
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+
+            surface_geom = geom
+            if kind == "pedestrian" and geom.geom_type in (
+                "LineString",
+                "MultiLineString",
+            ):
+                highway = _normalize_highway(row.get("highway", "default"))
+                width = 3.0 if highway == "pedestrian" else 2.0
+                surface_geom = geom.buffer(width * 0.5, cap_style=2, join_style=2)
+            if surface_geom.geom_type not in (
+                "Polygon",
+                "MultiPolygon",
+                "GeometryCollection",
+            ):
+                continue
+            surface_geom = _repair_geom(surface_geom)
+            if surface_geom is None:
+                continue
+
+            feature_tag = None
+            for column in (
+                "landuse",
+                "amenity",
+                "leisure",
+                "highway",
+                "railway",
+                "natural",
+                "landcover",
+            ):
+                value = _first_scalar(row.get(column))
+                if value is not None and not pd.isna(value):
+                    feature_tag = str(value).split(";")[0].strip().lower()
+                    break
+
+            x, y = _representative_xy(surface_geom)
+            tile_key = self._tile_key(x, y)
+            surface_geom = self._claim_surface_geometry(surface_geom, tile_key)
+            if surface_geom is None:
+                continue
+            z = self.sample_ground_z(surface_geom)
+            name = f"{kind}_{len(self.assets)}"
+            node = self._make_geomnode_from_extrusion(
+                surface_geom,
+                DEFAULT_SURFACE_THICKNESS,
+                name,
+            )
+            node.setZ(z + z_offsets[kind])
+            node.setTwoSided(True)
+            self._add_asset(
+                name=name,
+                nodepath=node,
+                kind=kind,
+                source_index=asset_idx,
+                metadata={
+                    "feature_tag": feature_tag,
+                    "surface_z": float(z + z_offsets[kind]),
+                    "thickness_m": DEFAULT_SURFACE_THICKNESS,
+                    "source": "osm",
+                },
+                tile_key=tile_key,
+            )
+
+    def _write_obj_from_nodepath(
+        self, nodepath: NodePath, fh, object_name: str, vertex_offset: int
+    ) -> int:
         node = nodepath.node()
         if isinstance(node, GeomNode):
             geom_paths = [nodepath]
@@ -742,11 +1397,15 @@ class CityMeshBuilder:
 
                 while not vreader.isAtEnd():
                     vertex = transform.xformPoint(vreader.getData3f())
-                    local_vertices.append((float(vertex[0]), float(vertex[1]), float(vertex[2])))
+                    local_vertices.append(
+                        (float(vertex[0]), float(vertex[1]), float(vertex[2]))
+                    )
 
                     if nreader is not None and not nreader.isAtEnd():
                         normal = nreader.getData3f()
-                        local_normals.append((float(normal[0]), float(normal[1]), float(normal[2])))
+                        local_normals.append(
+                            (float(normal[0]), float(normal[1]), float(normal[2]))
+                        )
 
                 for vx, vy, vz in local_vertices:
                     fh.write(f"v {vx:.6f} {vy:.6f} {vz:.6f}\n")
@@ -768,7 +1427,7 @@ class CityMeshBuilder:
                 vertex_offset += len(local_vertices)
 
         return vertex_offset
-    
+
     def _iter_polygon_rings(self, geom):
         if geom is None or geom.is_empty:
             return
@@ -783,7 +1442,7 @@ class CityMeshBuilder:
         elif geom.geom_type == "GeometryCollection":
             for part in geom.geoms:
                 yield from self._iter_polygon_rings(part)
-                
+
     def export_bam(self, filename: str = "city.bam", flatten: bool = False) -> Path:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         out_path = Path(self.output_dir, filename)
@@ -792,7 +1451,7 @@ class CityMeshBuilder:
         #     self.root.flattenStrong()
         self.root.writeBamFile(Filename.fromOsSpecific(str(out_path.resolve())))
         return out_path
-    
+
     def export_obj(self, filename: str = "city.obj") -> Path:
         """Export the city as a Wavefront OBJ file."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -821,7 +1480,7 @@ class CityMeshBuilder:
 
     def _load_texture(self, texture_path: str) -> Texture:
         path_cwd = Path.cwd()
-        texture_path = Path(path_cwd,texture_path)
+        texture_path = Path(path_cwd, texture_path)
         tex = TexturePool.loadTexture(texture_path)
         if tex is None:
             raise FileNotFoundError(f"Could not load texture: {texture_path}")
@@ -880,27 +1539,38 @@ class CityMeshBuilder:
         road_texture_path: str,
         park_texture_path: str,
         water_texture_path: str,
+        sidewalk_texture_path: str | None = None,
     ):
         road_tex = self._load_texture(str(road_texture_path))
         park_tex = self._load_texture(str(park_texture_path))
         water_tex = self._load_texture(str(water_texture_path))
+        sidewalk_tex = self._load_texture(str(sidewalk_texture_path))
+
         tex_stage = TextureStage("tex")
 
         texture_library = BuildingTextureLibrary(
             landuse_textures={k.lower(): Path(v) for k, v in building_rules},
             default_height_rules=[
-                (10.0, Path("assets/textures/building_materials/bricks/Bricks101_1K-JPG/Bricks101_1K-JPG_Color.jpg")),
-                (25.0, Path("assets/textures/building_materials/bricks/Bricks097_1K-JPG/Bricks097_1K-JPG_Color.jpg")),
-                (1e9, Path("assets/textures/building_materials/office/window-pattern-textures-building.jpg")),
+                (
+                    10.0,
+                    Path(
+                        "assets/textures/building_materials/bricks/Bricks101_1K-JPG/Bricks101_1K-JPG_Color.jpg"
+                    ),
+                ),
+                (
+                    25.0,
+                    Path(
+                        "assets/textures/building_materials/bricks/Bricks097_1K-JPG/Bricks097_1K-JPG_Color.jpg"
+                    ),
+                ),
+                (
+                    1e9,
+                    Path(
+                        "assets/textures/building_materials/office/window-pattern-textures-building.jpg"
+                    ),
+                ),
             ],
         )
-
-        for building in self.buildings:
-            if building.metadata.get("house_type"):
-                continue
-            tex_path = texture_library.select(building)
-            tex = self._load_texture(str(tex_path))
-            building.nodepath.setTexture(tex_stage, tex, 1)
 
         for asset in self.assets:
             if asset.kind == "road":
@@ -911,19 +1581,42 @@ class CityMeshBuilder:
                 asset.nodepath.setTexture(tex_stage, water_tex, 1)
             elif asset.kind == "bridge":
                 asset.nodepath.setTexture(tex_stage, road_tex, 1)
-            
+            elif asset.kind == "sidewalk":
+                asset.nodepath.setTexture(tex_stage, sidewalk_tex, 1)
+            elif asset.kind == "pedestrian":
+                asset.nodepath.setTexture(tex_stage, sidewalk_tex, 1)
+            elif asset.kind in ("parking", "railway_areas"):
+                asset.nodepath.setTexture(tex_stage, road_tex, 1)
+            elif asset.kind in ("landuse", "terrain"):
+                feature_tag = asset.metadata.get("feature_tag")
+                if asset.kind == "landuse" and feature_tag in (
+                    "commercial",
+                    "construction",
+                    "industrial",
+                    "retail",
+                    "residential",
+                ):
+                    asset.nodepath.setTexture(tex_stage, road_tex, 1)
+                else:
+                    asset.nodepath.setTexture(tex_stage, park_tex, 1)
+
     def export_manifest_csv(self) -> Path:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         records = []
         for asset in self.assets:
-            rec = {"name": asset.name, "kind": asset.kind, "source_index": asset.source_index}
+            rec = {
+                "name": asset.name,
+                "kind": asset.kind,
+                "source_index": asset.source_index,
+            }
             rec.update(asset.metadata)
             records.append(rec)
         df = pd.DataFrame.from_records(records)
         out_path = self.output_dir / "city_manifest.csv"
         df.to_csv(out_path, index=False)
         return out_path
-    
+
+
 @dataclass
 class BuildingAsset:
     name: str
@@ -937,7 +1630,15 @@ class BuildingAsset:
     metadata: dict = field(default_factory=dict)
 
     @classmethod
-    def from_row(cls, name: str, nodepath: NodePath, source_index: int, row, height_m: float, base_z: float):
+    def from_row(
+        cls,
+        name: str,
+        nodepath: NodePath,
+        source_index: int,
+        row,
+        height_m: float,
+        base_z: float,
+    ):
         def _first(v):
             if v is None:
                 return None
@@ -979,7 +1680,8 @@ class BuildingAsset:
         if self.landuse_tag:
             return str(self.landuse_tag).strip().lower()
         return "default"
-    
+
+
 @dataclass
 class BuildingTextureLibrary:
     landuse_textures: dict[str, Path]
@@ -995,4 +1697,3 @@ class BuildingTextureLibrary:
                 return tex_path
 
         return self.default_height_rules[-1][1]
-    

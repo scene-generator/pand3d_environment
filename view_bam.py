@@ -79,7 +79,7 @@ class BamViewer(ShowBase):
 
     def _setup_controls(self):
         # Movement
-        for key in ["w", "a", "s", "d", "q", "e", "shift"]:
+        for key in ["w", "a", "s", "d", "q", "e", "shift", "z", "x"]:
             self.accept(key, self._set_key, [key, True])
             self.accept(f"{key}-up", self._set_key, [key, False])
 
@@ -90,13 +90,15 @@ class BamViewer(ShowBase):
         # self.accept("l", self.dump_scene_graph)
         self.accept("mouse1", self._mouse_down, [True])
         self.accept("mouse1-up", self._mouse_down, [False])
+        self.accept("z", self.zoom_in)
+        self.accept("x", self.zoom_out)
 
         self.accept("escape", sys.exit)
 
         self._set_help_text()
 
     def _set_help_text(self):
-        cm = self.addScreenText(0.02, 0.96, "F: wireframe   T: textures   B: bounds   Mouse drag: orbit   WASD: pan")
+        cm = self.addScreenText(0.02, 0.96, "F: wireframe   T: textures   B: bounds   Mouse drag: orbit   WASD: pan   Z/X: zoom")
         cm.setScale(0.05)
 
     def addScreenText(self, x, y, text):
@@ -137,6 +139,21 @@ class BamViewer(ShowBase):
     def _mouse_down(self, down):
         self.mouse_down = down
         self.last_mouse = None
+    
+    def zoom_in(self):
+        fov = self.camLens.getFov()
+        self.camLens.setFov(
+            max(5.0, fov.x * 0.8),
+            max(5.0, fov.y * 0.8),
+        )
+
+
+    def zoom_out(self):
+        fov = self.camLens.getFov()
+        self.camLens.setFov(
+            min(120.0, fov.x * 1.2),
+            min(120.0, fov.y * 1.2),
+        )
 
     def _setup_picking(self):
         self.picker_trav = CollisionTraverser()

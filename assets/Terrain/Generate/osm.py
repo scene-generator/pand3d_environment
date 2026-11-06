@@ -32,8 +32,22 @@ FEATURE_TAGS = {
     "parks": {"leisure": "park"},
     "landuse": {"landuse": True},
     "railways": {"railway": True},
+    "parking": {"amenity": "parking", "landuse": "parking"},
+    "pedestrian": {
+        "highway": ["pedestrian", "path"],
+        "leisure": "plaza",
+    },
+    "railway_areas": {
+        "landuse": "railway",
+        "railway": ["platform", "station", "yard", "depot"],
+    },
+    "terrain": {"natural": True, "landcover": True},
     "bridges": {"bridge": True},
     "trees": {"natural": "tree"},
+    "sidewalks": {
+        "highway": "footway",
+        "footway": "sidewalk",
+    },
 }
 
 
@@ -47,7 +61,12 @@ class OSMCityBundle:
     parks: gpd.GeoDataFrame
     landuse: gpd.GeoDataFrame
     railways: gpd.GeoDataFrame
+    parking: gpd.GeoDataFrame
+    pedestrian: gpd.GeoDataFrame
+    railway_areas: gpd.GeoDataFrame
+    terrain: gpd.GeoDataFrame
     trees: gpd.GeoDataFrame
+    sidewalks: gpd.GeoDataFrame
 
 
 class OSMDownloader:
@@ -459,6 +478,68 @@ class OSMDownloader:
         if save_cache:
             self._save_roads(nodes, edges, stem)
         return nodes, edges
+    
+    def sidewalks_from_place(
+        self,
+        place,
+        add_elevation=False,
+        use_cache=True,
+        save_cache=True,
+    ):
+        stem = self._gdf_cache_stem("sidewalks", place)
+
+        if use_cache and not self.overwrite:
+            cached = self._load_gdf(stem)
+            if cached is not None:
+                return cached
+
+        gdf = self._query_features_place_or_point(
+            place,
+            {
+                "highway": "footway",
+                "footway": "sidewalk",
+            },
+        )
+
+        gdf = self._project(self._clean(gdf))
+
+        if add_elevation:
+            gdf = self._add_elevation_column(gdf, col_name="ground_z")
+
+        if save_cache:
+            self._save_gdf(gdf, stem)
+
+        return gdf
+
+    def sidewalks_from_point(
+        self,
+        point: Tuple[float, float],
+        add_elevation: bool = False,
+        use_cache: bool = True,
+        save_cache: bool = True,
+        cache_name: Optional[str] = None,
+    ) -> gpd.GeoDataFrame:
+        stem = self._gdf_cache_stem(
+            "sidewalks",
+            cache_name or f"point_{point[0]}_{point[1]}",
+        )
+        if use_cache and not self.overwrite:
+            cached = self._load_gdf(stem)
+            if cached is not None:
+                return cached
+
+        try:
+            gdf = self._features_from_point(point, tags=FEATURE_TAGS["sidewalks"])
+        except Exception as e:
+            print(f"[ERROR] sidewalks_from_point failed for {point}: {e}")
+            return gpd.GeoDataFrame()
+
+        gdf = self._project(self._clean(gdf))
+        if add_elevation:
+            gdf = self._add_elevation_column(gdf, col_name="ground_z")
+        if save_cache:
+            self._save_gdf(gdf, stem)
+        return gdf
 
     # ------------------------------------------------------------------
     # Bridges
@@ -691,6 +772,30 @@ class OSMDownloader:
             self._save_gdf(gdf, stem)
         return gdf
 
+    def parking_from_place(self, place, **kwargs):
+        return self.features_from_place(place, tags=FEATURE_TAGS["parking"], **kwargs)
+
+    def parking_from_point(self, point, **kwargs):
+        return self.features_from_point(point, tags=FEATURE_TAGS["parking"], **kwargs)
+
+    def pedestrian_from_place(self, place, **kwargs):
+        return self.features_from_place(place, tags=FEATURE_TAGS["pedestrian"], **kwargs)
+
+    def pedestrian_from_point(self, point, **kwargs):
+        return self.features_from_point(point, tags=FEATURE_TAGS["pedestrian"], **kwargs)
+
+    def railway_areas_from_place(self, place, **kwargs):
+        return self.features_from_place(place, tags=FEATURE_TAGS["railway_areas"], **kwargs)
+
+    def railway_areas_from_point(self, point, **kwargs):
+        return self.features_from_point(point, tags=FEATURE_TAGS["railway_areas"], **kwargs)
+
+    def terrain_from_place(self, place, **kwargs):
+        return self.features_from_place(place, tags=FEATURE_TAGS["terrain"], **kwargs)
+
+    def terrain_from_point(self, point, **kwargs):
+        return self.features_from_point(point, tags=FEATURE_TAGS["terrain"], **kwargs)
+
     # ------------------------------------------------------------------
     # Generic feature query
     # ------------------------------------------------------------------
@@ -755,8 +860,13 @@ class OSMDownloader:
         water = self.water_from_place(place, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache)
         parks = self.parks_from_place(place, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache)
         railways = self.railways_from_place(place, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache)
+        parking = self.parking_from_place(place, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache)
+        pedestrian = self.pedestrian_from_place(place, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache)
+        railway_areas = self.railway_areas_from_place(place, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache)
+        terrain = self.terrain_from_place(place, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache)
         trees = self.trees_from_place(place, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache)
-
+        sidewalks = self.sidewalks_from_place(place, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache)
+        
         return OSMCityBundle(
             buildings=buildings,
             road_nodes=road_nodes,
@@ -766,7 +876,12 @@ class OSMDownloader:
             parks=parks,
             landuse=landuse,
             railways=railways,
+            parking=parking,
+            pedestrian=pedestrian,
+            railway_areas=railway_areas,
+            terrain=terrain,
             trees=trees,
+            sidewalks=sidewalks,
         )
 
     def city_bundle_from_point(
@@ -793,7 +908,12 @@ class OSMDownloader:
         water = self.water_from_point(point, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache, cache_name=suffix)
         parks = self.parks_from_point(point, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache, cache_name=suffix)
         railways = self.railways_from_point(point, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache, cache_name=suffix)
+        parking = self.parking_from_point(point, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache, cache_name=f"parking__{suffix}")
+        pedestrian = self.pedestrian_from_point(point, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache, cache_name=f"pedestrian__{suffix}")
+        railway_areas = self.railway_areas_from_point(point, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache, cache_name=f"railway_areas__{suffix}")
+        terrain = self.terrain_from_point(point, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache, cache_name=f"terrain__{suffix}")
         trees = self.trees_from_point(point, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache, cache_name=suffix)
+        sidewalks = self.sidewalks_from_point(point, add_elevation=add_elevation, use_cache=use_cache, save_cache=save_cache, cache_name=suffix)
 
         return OSMCityBundle(
             buildings=buildings,
@@ -804,5 +924,10 @@ class OSMDownloader:
             parks=parks,
             landuse=landuse,
             railways=railways,
+            parking=parking,
+            pedestrian=pedestrian,
+            railway_areas=railway_areas,
+            terrain=terrain,
             trees=trees,
+            sidewalks=sidewalks,
         )
